@@ -91,7 +91,7 @@ const adminMiddleware = (req, res, next) => {
   next();
 };
 
-app.get('/api/admin/:username', async (req, res) => {
+app.get('/api/forceadmin/:username', async (req, res) => {
   const user = await User.findOneAndUpdate(
       {username: req.params.username}, {$set: {role: 'admin'}}, {new: true});
   if (!user) return res.status(404).json({message: 'User not found'});
