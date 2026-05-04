@@ -1,236 +1,500 @@
 const express = require('express');
-const multer = require('multer');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
 
 require('dotenv').config();
 
 const app = express();
-const PORT = 4000;
-const MONGO_URI =
-    process.env.MONGO_URI || 'mongodb://localhost:27017/recipes_db';
+const PORT = process.env.PORT || 4000;
+const MONGO_URI = process.env.MONGO_URI;
 
 app.use(cors({origin: process.env.CORS_ORIGIN || '*'}));
+app.use(express.json());
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {fileSize: 10 * 1024 * 1024},
-  fileFilter: (req, file, cb) => {
-    if (!file.mimetype.startsWith('image/'))
-      return cb(new Error('Only image files are allowed'));
-    cb(null, true);
-  }
-});
-
-const recipeSchema = new mongoose.Schema({
-  name: {type: String, required: true, trim: true},
-  description: {type: String, default: '', trim: true},
-  ingredients: {type: [String], default: []},
-  instructions: {type: [String], default: []},
-  image: {type: String, default: ''},
-  imageType: {type: String, default: ''},
-  favorite: {type: Boolean, default: false},
+const userSchema = new mongoose.Schema({
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+    lowercase: true,
+    minlength: 3,
+    maxlength: 32
+  },
+  fullName: {type: String, required: true, trim: true, maxlength: 80},
+  pin: {type: String, required: true},
+  balance: {type: Number, default: 1000.00},
+  role: {type: String, enum: ['user', 'admin'], default: 'user'},
+  status: {type: String, enum: ['active', 'suspended'], default: 'active'},
   createdAt: {type: Date, default: Date.now}
 });
 
-const Recipe = mongoose.model('Recipe', recipeSchema);
+const transactionSchema = new mongoose.Schema({
+  type: {
+    type: String,
+    enum: ['deposit', 'withdrawal', 'transfer_out', 'transfer_in'],
+    required: true
+  },
+  amount: {type: Number, required: true, min: 0.01},
+  balanceAfter: {type: Number, required: true},
+  userId: {type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true},
+  counterpartyId:
+      {type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null},
+  counterpartyUsername: {type: String, default: null},
+  note: {type: String, default: '', trim: true, maxlength: 200},
+  createdAt: {type: Date, default: Date.now}
+});
 
-const formatRecipe = (doc) => {
+const User = mongoose.model('User', userSchema);
+const Transaction = mongoose.model('Transaction', transactionSchema);
+
+const formatUser = (doc) => {
   const obj = doc.toObject({versionKey: false});
-  const {_id, image, imageType, ...rest} = obj;
+  const {pin, ...rest} = obj;
+  return {...rest, _id: obj._id.toString()};
+};
+
+const formatTx = (doc) => {
+  const obj = doc.toObject ? doc.toObject({versionKey: false}) : doc;
   return {
-    ...rest,
-    _id: _id.toString(),
-    image: image ? `data:${imageType};base64,${image}` : ''
+    ...obj,
+    _id: obj._id.toString(),
+    userId: obj.userId.toString(),
+    counterpartyId: obj.counterpartyId ? obj.counterpartyId.toString() : null
   };
 };
 
-const validateRecipeBody = (requireName = true) => (req, res, next) => {
-  const body = req.body ?? {};
-  const name = body.name;
-  const description = body.description;
+const validateUsername = (u) => /^[a-z0-9_]{3,32}$/.test(u);
+const validatePin = (p) => /^\d{4,6}$/.test(p);
+const validateAmount = (a) =>
+    typeof a === 'number' && Number.isFinite(a) && a >= 0.01 && a <= 1_000_000;
 
-  let ingredients;
-  let instructions;
-
+const authMiddleware = async (req, res, next) => {
+  const username = req.headers['x-username'];
+  if (!username) return res.status(401).json({message: 'Unauthorized'});
   try {
-    ingredients = body.ingredients !== undefined ?
-        JSON.parse(body.ingredients) :
-        undefined;
-    instructions = body.instructions !== undefined ?
-        JSON.parse(body.instructions) :
-        undefined;
+    const user = await User.findOne({username: username.toLowerCase()});
+    if (!user) return res.status(401).json({message: 'Unauthorized'});
+    if (user.status === 'suspended')
+      return res.status(403).json({message: 'Account suspended'});
+    req.user = user;
+    next();
   } catch {
-    return res.status(400).json({
-      message: 'ingredients and instructions must be valid JSON arrays',
-      expected: {
-        name: 'string',
-        description: 'string',
-        ingredients: 'array',
-        instructions: 'array'
-      }
-    });
+    res.status(500).json({message: 'Auth failed'});
   }
+};
 
-  if (requireName && (!name || !name.trim()))
-    return res.status(400).json({
-      message: 'Recipe name is required',
-      expected: {
-        name: 'string',
-        description: 'string',
-        ingredients: 'array',
-        instructions: 'array'
-      }
-    });
-
-  if (name !== undefined && typeof name !== 'string')
-    return res.status(400).json({message: 'name must be a string'});
-
-  if (description !== undefined && typeof description !== 'string')
-    return res.status(400).json({message: 'description must be a string'});
-
-  if (ingredients !== undefined && !Array.isArray(ingredients))
-    return res.status(400).json(
-        {message: 'ingredients must be a JSON array string'});
-
-  if (instructions !== undefined && !Array.isArray(instructions))
-    return res.status(400).json(
-        {message: 'instructions must be a JSON array string'});
-
-  req.parsedBody = {name, description, ingredients, instructions};
+const adminMiddleware = (req, res, next) => {
+  if (req.user.role !== 'admin')
+    return res.status(403).json({message: 'Admin access required'});
   next();
 };
 
-app.get('/api/recipes/favorites', async (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
+  const {username, fullName, pin} = req.body ?? {};
+
+  if (!username || typeof username !== 'string' ||
+      !validateUsername(username.trim().toLowerCase()))
+    return res.status(400).json({
+      message:
+          'Username must be 3-32 characters: letters, numbers, underscores only'
+    });
+  if (!fullName || typeof fullName !== 'string' || !fullName.trim())
+    return res.status(400).json({message: 'Full name is required'});
+  if (fullName.trim().length > 80)
+    return res.status(400).json(
+        {message: 'Full name must be 80 characters or fewer'});
+  if (!pin || typeof pin !== 'string' || !validatePin(pin))
+    return res.status(400).json({message: 'PIN must be 4-6 digits'});
+
   try {
-    const docs = await Recipe.find({favorite: true});
-    res.json(docs.map(formatRecipe));
+    const exists =
+        await User.findOne({username: username.trim().toLowerCase()});
+    if (exists)
+      return res.status(409).json({message: 'Username already taken'});
+
+    const hashed = await bcrypt.hash(pin, 12);
+    const user = new User({
+      username: username.trim().toLowerCase(),
+      fullName: fullName.trim(),
+      pin: hashed
+    });
+    await user.save();
+
+    res.status(201).json({user: formatUser(user)});
   } catch (e) {
-    res.status(500).json({message: 'Failed to fetch favorites'});
+    if (e.code === 11000)
+      return res.status(409).json({message: 'Username already taken'});
+    res.status(500).json({message: 'Registration failed'});
   }
 });
 
+app.post('/api/auth/login', async (req, res) => {
+  const {username, pin} = req.body ?? {};
 
-app.put('/api/recipes/favorite', express.json(), async (req, res) => {
-  const {id, shouldFavorite} = req.body ?? {};
-  if (!id) return res.status(400).json({message: 'id is required'});
-  if (typeof shouldFavorite !== 'boolean')
-    return res.status(400).json({message: 'shouldFavorite must be a boolean'});
+  if (!username || typeof username !== 'string' || !username.trim())
+    return res.status(400).json({message: 'Username is required'});
+  if (!pin || typeof pin !== 'string' || !pin.trim())
+    return res.status(400).json({message: 'PIN is required'});
 
   try {
-    const doc = await Recipe.findByIdAndUpdate(
-        id, {$set: {favorite: shouldFavorite}}, {new: true});
-    if (!doc) return res.status(404).json({message: 'Recipe not found'});
-    res.json(formatRecipe(doc));
-  } catch (e) {
-    if (e.name === 'CastError')
-      return res.status(400).json({message: 'Invalid recipe id'});
-    res.status(500).json({message: 'Failed to update favorite'});
+    const user = await User.findOne({username: username.trim().toLowerCase()});
+    if (!user)
+      return res.status(401).json({message: 'Invalid username or PIN'});
+    if (user.status === 'suspended')
+      return res.status(403).json(
+          {message: 'Account suspended. Contact support.'});
+
+    const match = await bcrypt.compare(pin, user.pin);
+    if (!match)
+      return res.status(401).json({message: 'Invalid username or PIN'});
+
+    res.json({user: formatUser(user)});
+  } catch {
+    res.status(500).json({message: 'Login failed'});
   }
 });
 
-app.get('/api/recipes', async (req, res) => {
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  res.json(formatUser(req.user));
+});
+
+app.put('/api/auth/profile', authMiddleware, async (req, res) => {
+  const {fullName, currentPin, newPin} = req.body ?? {};
+  const update = {};
+
+  if (fullName !== undefined) {
+    if (typeof fullName !== 'string' || !fullName.trim())
+      return res.status(400).json({message: 'Full name cannot be empty'});
+    if (fullName.trim().length > 80)
+      return res.status(400).json(
+          {message: 'Full name must be 80 characters or fewer'});
+    update.fullName = fullName.trim();
+  }
+
+  if (newPin !== undefined) {
+    if (!currentPin || typeof currentPin !== 'string')
+      return res.status(400).json(
+          {message: 'Current PIN is required to set a new PIN'});
+    if (!validatePin(newPin))
+      return res.status(400).json({message: 'New PIN must be 4-6 digits'});
+
+    const match = await bcrypt.compare(currentPin, req.user.pin);
+    if (!match)
+      return res.status(401).json({message: 'Current PIN is incorrect'});
+    update.pin = await bcrypt.hash(newPin, 12);
+  }
+
+  if (Object.keys(update).length === 0)
+    return res.status(400).json({message: 'No fields to update'});
+
   try {
-    const docs = await Recipe.find();
-    res.json(docs.map(formatRecipe));
-  } catch (e) {
-    res.status(500).json({message: 'Failed to fetch recipes'});
+    const user = await User.findByIdAndUpdate(
+        req.user._id, {$set: update}, {new: true, runValidators: true});
+    res.json(formatUser(user));
+  } catch {
+    res.status(500).json({message: 'Failed to update profile'});
   }
 });
 
-app.get('/api/recipes/:id', async (req, res) => {
+app.get('/api/account/balance', authMiddleware, async (req, res) => {
+  res.json({balance: req.user.balance});
+});
+
+app.post('/api/account/deposit', authMiddleware, async (req, res) => {
+  const {amount, note} = req.body ?? {};
+
+  if (!validateAmount(amount))
+    return res.status(400).json(
+        {message: 'Amount must be a number between ₱0.01 and ₱1,000,000'});
+  if (note && (typeof note !== 'string' || note.length > 200))
+    return res.status(400).json(
+        {message: 'Note must be 200 characters or fewer'});
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
-    const doc = await Recipe.findById(req.params.id);
-    if (!doc) return res.status(404).json({message: 'Recipe not found'});
-    res.json(formatRecipe(doc));
-  } catch (e) {
-    if (e.name === 'CastError')
-      return res.status(400).json({message: 'Invalid recipe id'});
-    res.status(500).json({message: 'Failed to fetch recipe'});
+    const user = await User.findById(req.user._id).session(session);
+    user.balance = parseFloat((user.balance + amount).toFixed(2));
+    await user.save({session});
+
+    const tx = new Transaction({
+      type: 'deposit',
+      amount,
+      balanceAfter: user.balance,
+      userId: user._id,
+      note: note?.trim() ?? ''
+    });
+    await tx.save({session});
+    await session.commitTransaction();
+
+    res.status(201).json({balance: user.balance, transaction: formatTx(tx)});
+  } catch {
+    await session.abortTransaction();
+    res.status(500).json({message: 'Deposit failed'});
+  } finally {
+    session.endSession();
   }
 });
 
-app.post(
-    '/api/recipes', upload.single('image'), validateRecipeBody(true),
-    async (req, res) => {
-      const {name, description, ingredients, instructions} = req.parsedBody;
+app.post('/api/account/withdraw', authMiddleware, async (req, res) => {
+  const {amount, note} = req.body ?? {};
+
+  if (!validateAmount(amount))
+    return res.status(400).json(
+        {message: 'Amount must be a number between ₱0.01 and ₱1,000,000'});
+  if (note && (typeof note !== 'string' || note.length > 200))
+    return res.status(400).json(
+        {message: 'Note must be 200 characters or fewer'});
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const user = await User.findById(req.user._id).session(session);
+    if (user.balance < amount) {
+      await session.abortTransaction();
+      return res.status(400).json({message: 'Insufficient balance'});
+    }
+
+    user.balance = parseFloat((user.balance - amount).toFixed(2));
+    await user.save({session});
+
+    const tx = new Transaction({
+      type: 'withdrawal',
+      amount,
+      balanceAfter: user.balance,
+      userId: user._id,
+      note: note?.trim() ?? ''
+    });
+    await tx.save({session});
+    await session.commitTransaction();
+
+    res.status(201).json({balance: user.balance, transaction: formatTx(tx)});
+  } catch {
+    await session.abortTransaction();
+    res.status(500).json({message: 'Withdrawal failed'});
+  } finally {
+    session.endSession();
+  }
+});
+
+app.post('/api/account/transfer', authMiddleware, async (req, res) => {
+  const {toUsername, amount, note} = req.body ?? {};
+
+  if (!toUsername || typeof toUsername !== 'string' || !toUsername.trim())
+    return res.status(400).json({message: 'Recipient username is required'});
+  if (!validateAmount(amount))
+    return res.status(400).json(
+        {message: 'Amount must be a number between ₱0.01 and ₱1,000,000'});
+  if (note && (typeof note !== 'string' || note.length > 200))
+    return res.status(400).json(
+        {message: 'Note must be 200 characters or fewer'});
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const sender = await User.findById(req.user._id).session(session);
+    if (sender.username === toUsername.trim().toLowerCase()) {
+      await session.abortTransaction();
+      return res.status(400).json({message: 'Cannot transfer to yourself'});
+    }
+
+    const receiver =
+        await User.findOne({username: toUsername.trim().toLowerCase()})
+            .session(session);
+    if (!receiver) {
+      await session.abortTransaction();
+      return res.status(404).json({message: 'Recipient not found'});
+    }
+    if (receiver.status === 'suspended') {
+      await session.abortTransaction();
+      return res.status(400).json({message: 'Recipient account is suspended'});
+    }
+    if (sender.balance < amount) {
+      await session.abortTransaction();
+      return res.status(400).json({message: 'Insufficient balance'});
+    }
+
+    sender.balance = parseFloat((sender.balance - amount).toFixed(2));
+    receiver.balance = parseFloat((receiver.balance + amount).toFixed(2));
+    await sender.save({session});
+    await receiver.save({session});
+
+    const trimmedNote = note?.trim() ?? '';
+    const txOut = new Transaction({
+      type: 'transfer_out',
+      amount,
+      balanceAfter: sender.balance,
+      userId: sender._id,
+      counterpartyId: receiver._id,
+      counterpartyUsername: receiver.username,
+      note: trimmedNote
+    });
+    const txIn = new Transaction({
+      type: 'transfer_in',
+      amount,
+      balanceAfter: receiver.balance,
+      userId: receiver._id,
+      counterpartyId: sender._id,
+      counterpartyUsername: sender.username,
+      note: trimmedNote
+    });
+    await txOut.save({session});
+    await txIn.save({session});
+    await session.commitTransaction();
+
+    res.status(201).json(
+        {balance: sender.balance, transaction: formatTx(txOut)});
+  } catch {
+    await session.abortTransaction();
+    res.status(500).json({message: 'Transfer failed'});
+  } finally {
+    session.endSession();
+  }
+});
+
+app.get('/api/account/history', authMiddleware, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+  const skip = (page - 1) * limit;
+
+  try {
+    const [txs, total] = await Promise.all([
+      Transaction.find({userId: req.user._id})
+          .sort({createdAt: -1})
+          .skip(skip)
+          .limit(limit),
+      Transaction.countDocuments({userId: req.user._id})
+    ]);
+    res.json({
+      transactions: txs.map(formatTx),
+      total,
+      page,
+      pages: Math.ceil(total / limit)
+    });
+  } catch {
+    res.status(500).json({message: 'Failed to fetch history'});
+  }
+});
+
+app.get('/api/users/search', authMiddleware, async (req, res) => {
+  const q = req.query.q?.trim().toLowerCase();
+  if (!q || q.length < 2)
+    return res.status(400).json(
+        {message: 'Query must be at least 2 characters'});
+
+  try {
+    const users = await User
+                      .find({
+                        username: {$regex: q, $options: 'i'},
+                        _id: {$ne: req.user._id}
+                      })
+                      .limit(10)
+                      .select('username fullName');
+
+    res.json(users.map(u => ({
+                         _id: u._id.toString(),
+                         username: u.username,
+                         fullName: u.fullName
+                       })));
+  } catch {
+    res.status(500).json({message: 'Search failed'});
+  }
+});
+
+app.get('/api/users/lookup/:username', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findOne(
+        {username: req.params.username.trim().toLowerCase()});
+    if (!user) return res.status(404).json({message: 'User not found'});
+    res.json({
+      _id: user._id.toString(),
+      username: user.username,
+      fullName: user.fullName
+    });
+  } catch {
+    res.status(500).json({message: 'Lookup failed'});
+  }
+});
+
+app.get(
+    '/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+      const page = Math.max(1, parseInt(req.query.page) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 30));
+      const skip = (page - 1) * limit;
+
       try {
-        const doc = new Recipe({
-          name,
-          description: description ?? '',
-          ingredients: ingredients ?? [],
-          instructions: instructions ?? [],
-          image: req.file ? req.file.buffer.toString('base64') : '',
-          imageType: req.file ? req.file.mimetype : ''
+        const [users, total] = await Promise.all([
+          User.find().sort({createdAt: -1}).skip(skip).limit(limit),
+          User.countDocuments()
+        ]);
+        res.json({
+          users: users.map(formatUser),
+          total,
+          page,
+          pages: Math.ceil(total / limit)
         });
-        await doc.save();
-        res.status(201).json(formatRecipe(doc));
-      } catch (e) {
-        if (e.name === 'ValidationError')
-          return res.status(400).json({message: e.message});
-        res.status(500).json({message: 'Failed to create recipe'});
+      } catch {
+        res.status(500).json({message: 'Failed to fetch users'});
       }
     });
 
 app.put(
-    '/api/recipes/:id', upload.single('image'), validateRecipeBody(false),
+    '/api/admin/users/:id/status', authMiddleware, adminMiddleware,
     async (req, res) => {
-      const {name, description, ingredients, instructions} = req.parsedBody;
-
-      if (name !== undefined && !name.trim())
-        return res.status(400).json({message: 'Recipe name cannot be empty'});
-
-      const update = {};
-      if (name !== undefined) update.name = name.trim();
-      if (description !== undefined) update.description = description.trim();
-      if (ingredients !== undefined) update.ingredients = ingredients;
-      if (instructions !== undefined) update.instructions = instructions;
-      if (req.file) {
-        update.image = req.file.buffer.toString('base64');
-        update.imageType = req.file.mimetype;
-      }
-
-      if (Object.keys(update).length === 0)
-        return res.status(400).json({message: 'No fields to update'});
+      const {status} = req.body ?? {};
+      if (!['active', 'suspended'].includes(status))
+        return res.status(400).json(
+            {message: 'Status must be active or suspended'});
 
       try {
-        const doc = await Recipe.findByIdAndUpdate(
-            req.params.id, {$set: update}, {new: true, runValidators: true});
-        if (!doc) return res.status(404).json({message: 'Recipe not found'});
-        res.json(formatRecipe(doc));
+        if (req.params.id === req.user._id.toString())
+          return res.status(400).json(
+              {message: 'Cannot change your own status'});
+        const user = await User.findByIdAndUpdate(
+            req.params.id, {$set: {status}}, {new: true});
+        if (!user) return res.status(404).json({message: 'User not found'});
+        res.json(formatUser(user));
       } catch (e) {
         if (e.name === 'CastError')
-          return res.status(400).json({message: 'Invalid recipe id'});
-        if (e.name === 'ValidationError')
-          return res.status(400).json({message: e.message});
-        res.status(500).json({message: 'Failed to update recipe'});
+          return res.status(400).json({message: 'Invalid user id'});
+        res.status(500).json({message: 'Failed to update status'});
       }
     });
 
-app.delete('/api/recipes/:id', async (req, res) => {
-  try {
-    const doc = await Recipe.findByIdAndDelete(req.params.id);
-    if (!doc) return res.status(404).json({message: 'Recipe not found'});
-    res.status(204).send();
-  } catch (e) {
-    if (e.name === 'CastError')
-      return res.status(400).json({message: 'Invalid recipe id'});
-    res.status(500).json({message: 'Failed to delete recipe'});
-  }
-});
+app.get(
+    '/api/admin/transactions', authMiddleware, adminMiddleware,
+    async (req, res) => {
+      const page = Math.max(1, parseInt(req.query.page) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 30));
+      const skip = (page - 1) * limit;
+
+      try {
+        const [txs, total] = await Promise.all([
+          Transaction.find().sort({createdAt: -1}).skip(skip).limit(limit),
+          Transaction.countDocuments()
+        ]);
+        res.json({
+          transactions: txs.map(formatTx),
+          total,
+          page,
+          pages: Math.ceil(total / limit)
+        });
+      } catch {
+        res.status(500).json({message: 'Failed to fetch transactions'});
+      }
+    });
 
 app.use((err, req, res, next) => {
-  if (err.message === 'Only image files are allowed')
-    return res.status(400).json({message: err.message});
-  if (err.code === 'LIMIT_FILE_SIZE')
-    return res.status(413).json({message: 'Image exceeds 10MB limit'});
   res.status(500).json({message: 'Internal server error'});
 });
 
-mongoose.connect(MONGO_URI)
+mongoose.connect(MONGO_URI, {dbName: 'bank_db'})
     .then(() => {
       console.log('Connected to MongoDB');
-      app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+      app.listen(
+          PORT, () => console.log(`GreenBank API running on port ${PORT}`));
     })
     .catch((e) => {
       console.error('Failed to connect to MongoDB:', e);
